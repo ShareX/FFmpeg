@@ -1,0 +1,159 @@
+# Builds and publishes the Linux FFmpeg zips that XerahS downloads.
+#
+# Linux only. The Windows zips on the v<version> releases are made and uploaded
+# separately and are not touched here. The Linux release is published as
+# v<version>-linux and is never marked "latest", so ShareX (which reads
+# /releases/latest or a fixed v<version> URL) sees no change.
+name: Linux release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: FFmpeg release branch to build (addin name, e.g. 8.1)
+        required: true
+        default: "8.1"
+      builds_ref:
+        description: ShareX/FFmpeg-Builds branch, tag or commit
+        required: true
+        default: linux
+      tag:
+        description: Release tag (default v<version>-linux; use v<version>-linux.2 for a rebuild)
+        required: false
+      publish:
+        description: Publish the release (off = build and verify only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target: [linux64, linuxarm64]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ShareX/FFmpeg-Builds
+          ref: ${{ inputs.builds_ref }}
+      - name: Build
+        run: sharex/build-linux.sh "${{ matrix.target }}" "${{ inputs.version }}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  verify:
+    name: Verify ${{ matrix.rid }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { target: linux64, rid: linux-x64, runner: ubuntu-24.04 }
+          - { target: linuxarm64, rid: linux-arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ShareX/FFmpeg-Builds
+          ref: ${{ inputs.builds_ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist
+      - run: sharex/verify-linux.sh "dist/ffmpeg-${{ inputs.version }}-${{ matrix.rid }}.zip"
+
+  publish:
+    name: Sign and publish
+    needs: verify
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag || format('v{0}-linux', inputs.version) }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check tag
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+-linux(\.[0-9]+)?$ ]] || { echo "Tag must look like v8.1-linux or v8.1-linux.2"; exit 1; }
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Releases are immutable; pick a new tag."; exit 1
+          fi
+          echo "LATEST_BEFORE=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" >> "$GITHUB_ENV"
+
+      - name: Checksums and signature
+        working-directory: dist
+        env:
+          SIGNING_KEY: ${{ secrets.LINUX_SIGNING_KEY }}
+        run: |
+          sha256sum "ffmpeg-$VERSION-linux-x64.zip" "ffmpeg-$VERSION-linux-arm64.zip" > SHA256SUMS
+          cat SHA256SUMS
+          umask 077
+          key="$(mktemp)"
+          trap 'rm -f -- "$key"' EXIT
+          printf '%s\n' "$SIGNING_KEY" > "$key"
+          openssl dgst -sha256 -sign "$key" -out SHA256SUMS.sig SHA256SUMS
+          # Fails the job if the secret does not match the public key XerahS pins.
+          openssl dgst -sha256 -verify ../keys/linux-release-2026.pub.pem -signature SHA256SUMS.sig SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.zip
+
+      - name: Release notes
+        run: |
+          {
+            echo "Static GPL FFmpeg $VERSION for Linux, built for [XerahS](https://github.com/KovaForge/XerahS)."
+            echo
+            echo "Each zip holds \`ffmpeg\`, \`ffprobe\` and \`LICENSE.txt\`. Runs on glibc 2.28 or newer."
+            echo
+            echo "Verify:"
+            echo
+            echo '```bash'
+            echo "curl -sLO https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/keys/linux-release-2026.pub.pem"
+            echo "openssl dgst -sha256 -verify linux-release-2026.pub.pem -signature SHA256SUMS.sig SHA256SUMS"
+            echo "sha256sum -c SHA256SUMS"
+            echo "gh attestation verify ffmpeg-$VERSION-linux-x64.zip -R $GITHUB_REPOSITORY"
+            echo '```'
+            echo
+            echo "Source: FFmpeg branch \`release/$VERSION\` (exact revision in the build name below), built with [ShareX/FFmpeg-Builds](https://github.com/ShareX/FFmpeg-Builds/tree/linux/sharex)."
+            echo
+            echo '```text'
+            cat dist/build-info-linux-x64.txt
+            echo
+            cat dist/build-info-linux-arm64.txt
+            echo '```'
+          } > notes.md
+
+      - name: Publish
+        run: |
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "FFmpeg $VERSION for Linux" --notes-file notes.md --latest=false \
+            "dist/ffmpeg-$VERSION-linux-x64.zip" "dist/ffmpeg-$VERSION-linux-arm64.zip" \
+            dist/SHA256SUMS dist/SHA256SUMS.sig
+
+      - name: ShareX still sees the same latest release
+        run: |
+          after="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          echo "latest before: $LATEST_BEFORE, after: $after"
+          [[ "$after" == "$LATEST_BEFORE" ]]
